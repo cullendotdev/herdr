@@ -330,6 +330,25 @@ Set `mouse_scroll_lines` to change how many pane scrollback lines each mouse whe
 
 Set `show_agent_labels_on_pane_borders = true` if you want detected agent labels in split pane borders when no manual pane label is set.
 
+### Pane borders
+
+Control how pane edges are drawn in multi-pane layouts.
+
+```toml
+[ui.pane_border]
+mode = "box"
+style = "thick"
+active_color = "accent"
+inactive_color = "overlay0"
+```
+
+| Key | Values | Default | Description |
+|---|---|---|---|
+| `mode` | `"box"`, `"line"` | `"box"` | `"box"` draws a full border block around each pane. `"line"` draws single-character split lines between panes (tmux-style); junction characters (`├┤┬┴┼` / `┣┫┳┻╋`) are chosen automatically based on neighbouring lines. |
+| `style` | `"thick"`, `"plain"` | `"thick"` | Border character set. `"thick"` uses heavy box-drawing characters; `"plain"` uses thin ones. In `"box"` mode the focused pane uses the configured style while terminal input is active; unfocused panes and panes outside terminal mode use the plain style. In `"line"` mode the configured style applies to all split-line characters. |
+| `active_color` | palette token (`accent`, `green`, `overlay0`, …) or literal color | `"accent"` | Color for split lines that border the focused pane. In `"box"` mode the focused pane's full border uses this color. In `"line"` mode only the split-line segments directly adjacent to the focused pane are highlighted; lines between two unfocused panes use `inactive_color`. |
+| `inactive_color` | same as `active_color` | `"overlay0"` | Color for borders of unfocused panes. |
+
 ## Notifications
 
 Herdr can show popup notifications when agents finish or need input.

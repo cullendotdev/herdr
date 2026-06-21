@@ -244,6 +244,7 @@ fn compute_view_internal(
         terminal_area,
         resize_panes,
         cell_size,
+        &split_borders,
     );
     if resize_panes {
         resize_background_tab_panes_to_terminal_area(
@@ -319,6 +320,7 @@ fn compute_mobile_view(
         terminal_area,
         resize_panes,
         cell_size,
+        &split_borders,
     );
     if resize_panes {
         resize_background_tab_panes_to_terminal_area(

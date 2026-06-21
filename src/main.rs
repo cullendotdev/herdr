@@ -275,6 +275,21 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Show detected/reported agent labels in split pane borders when no manual pane name is set.
 # show_agent_labels_on_pane_borders = false
 
+# Pane border appearance — control how pane edges are drawn in multi-pane layouts.
+[ui.pane_border]
+# Border mode: "box" (full per-pane border box) or "line" (single split-line characters
+# between panes, tmux style). "box" is the default.
+# mode = "box"
+# Border character style: "thick" or "plain". In box mode the focused pane uses the
+# configured style while terminal input is active; plain otherwise. In line mode the
+# configured style always applies.
+# style = "thick"
+# Color for the focused pane's border. Palette tokens (accent, overlay0, green, etc.) or
+# literal colors (hex, named, rgb). Default: "accent".
+# active_color = "accent"
+# Color for unfocused pane borders. Same format as active_color. Default: "overlay0".
+# inactive_color = "overlay0"
+
 # Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"

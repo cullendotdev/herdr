@@ -1,11 +1,12 @@
 use std::num::NonZeroUsize;
 
 use crossterm::event::KeyModifiers;
+use ratatui::style::Color;
 use serde::{de, Deserialize, Deserializer, Serialize};
 
 use super::{
-    BindingConfig, CommandKeybindConfig, SoundConfig, ThemeConfig, DEFAULT_MOBILE_WIDTH_THRESHOLD,
-    DEFAULT_MOUSE_SCROLL_LINES, DEFAULT_SCROLLBACK_LIMIT_BYTES,
+    theme::parse_color, BindingConfig, CommandKeybindConfig, SoundConfig, ThemeConfig,
+    DEFAULT_MOBILE_WIDTH_THRESHOLD, DEFAULT_MOUSE_SCROLL_LINES, DEFAULT_SCROLLBACK_LIMIT_BYTES,
 };
 
 pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
@@ -422,6 +423,109 @@ pub struct WorktreesConfig {
     pub directory: String,
 }
 
+/// Pre-parsed border color, resolved from a user-facing color string.
+///
+/// At config-load time the string is categorised as either a palette token
+/// (resolved at render time via the current palette) or a literal colour
+/// (parsed once upfront).  This avoids re-parsing literal colours every frame.
+#[derive(Debug, Clone)]
+pub struct BorderColorConfig {
+    /// Original config string — used for palette-token resolution at render time.
+    pub raw: String,
+    /// `None` when `raw` is a palette token; `Some(color)` when it is a
+    /// pre-parsed literal.
+    pub parsed: Option<Color>,
+}
+
+impl BorderColorConfig {
+    /// Build from a user-facing colour string.
+    ///
+    /// Palette token names (matching `Palette::resolve_token`) are stored as
+    /// tokens so they can be resolved against the *current* palette each frame.
+    /// Everything else is parsed as a literal colour once.
+    pub fn from_string(s: &str) -> Self {
+        let parsed = if is_palette_token(s) {
+            None
+        } else {
+            Some(parse_color(s))
+        };
+        Self {
+            raw: s.to_string(),
+            parsed,
+        }
+    }
+}
+
+/// Return `true` when `s` is a palette token name recognised by
+/// `Palette::resolve_token`.  Keep in sync with the match arms there.
+fn is_palette_token(s: &str) -> bool {
+    matches!(
+        s,
+        "accent"
+            | "overlay0"
+            | "overlay1"
+            | "text"
+            | "subtext0"
+            | "surface0"
+            | "surface1"
+            | "surface_dim"
+            | "panel_bg"
+            | "mauve"
+            | "green"
+            | "yellow"
+            | "red"
+            | "blue"
+            | "teal"
+            | "peach"
+    )
+}
+
+/// Pane border visual mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaneBorderMode {
+    /// Each pane gets a full border box (current default).
+    Box,
+    /// Draw only split lines between panes, no per-pane box (tmux style).
+    Line,
+}
+
+/// Pane border character set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaneBorderStyle {
+    /// Thick line-drawing characters.
+    Thick,
+    /// Plain (thin) line-drawing characters.
+    Plain,
+}
+
+/// Pane border appearance configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PaneBorderConfig {
+    /// Border mode: "box" (full per-pane box) or "line" (split-lines only).
+    pub mode: PaneBorderMode,
+    /// Border character style: "thick" or "plain".
+    pub style: PaneBorderStyle,
+    /// Color for the focused pane's border. Accepts palette tokens (accent, overlay0, etc.)
+    /// or literal colors (hex, named, rgb). Default: "accent".
+    pub active_color: String,
+    /// Color for unfocused pane borders. Same format as active_color. Default: "overlay0".
+    pub inactive_color: String,
+}
+
+impl Default for PaneBorderConfig {
+    fn default() -> Self {
+        Self {
+            mode: PaneBorderMode::Box,
+            style: PaneBorderStyle::Thick,
+            active_color: "accent".into(),
+            inactive_color: "overlay0".into(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -446,6 +550,9 @@ pub struct UiConfig {
     pub prompt_new_tab_name: bool,
     /// Show agent labels in split pane borders when no manual pane label is set. Default: false.
     pub show_agent_labels_on_pane_borders: bool,
+    /// Pane border appearance. Controls border style, color, and mode.
+    #[serde(default)]
+    pub pane_border: PaneBorderConfig,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
     /// Accent color for highlights, borders, and navigation UI.
@@ -633,6 +740,7 @@ impl Default for UiConfig {
             confirm_close: true,
             prompt_new_tab_name: true,
             show_agent_labels_on_pane_borders: false,
+            pane_border: PaneBorderConfig::default(),
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             accent: "cyan".into(),
             toast: ToastConfig::default(),
@@ -849,6 +957,30 @@ show_agent_labels_on_pane_borders = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.ui.show_agent_labels_on_pane_borders);
+    }
+
+    #[test]
+    fn pane_border_config_defaults_and_parses() {
+        let default_config = Config::default();
+        let pb = &default_config.ui.pane_border;
+        assert!(matches!(pb.mode, PaneBorderMode::Box));
+        assert!(matches!(pb.style, PaneBorderStyle::Thick));
+        assert_eq!(pb.active_color, "accent");
+        assert_eq!(pb.inactive_color, "overlay0");
+
+        let toml = r##"
+[ui.pane_border]
+mode = "line"
+style = "plain"
+active_color = "green"
+inactive_color = "#333333"
+"##;
+        let config: Config = toml::from_str(toml).unwrap();
+        let pb = &config.ui.pane_border;
+        assert!(matches!(pb.mode, PaneBorderMode::Line));
+        assert!(matches!(pb.style, PaneBorderStyle::Plain));
+        assert_eq!(pb.active_color, "green");
+        assert_eq!(pb.inactive_color, "#333333");
     }
 
     #[test]
