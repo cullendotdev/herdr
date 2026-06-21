@@ -6,11 +6,14 @@ use ratatui::{
     Frame,
 };
 
+use std::collections::HashSet;
+
 use super::scrollbar::{render_pane_scrollbar, should_show_scrollbar};
 use super::widgets::panel_contrast_fg;
 use crate::app::state::Palette;
 use crate::app::{AppState, Mode};
-use crate::layout::PaneInfo;
+use crate::config::{PaneBorderMode, PaneBorderStyle};
+use crate::layout::{PaneInfo, SplitBorder};
 use crate::terminal::{TerminalRuntime, TerminalRuntimeRegistry};
 
 pub(crate) fn pane_is_scrolled_back(rt: &TerminalRuntime) -> bool {
@@ -63,6 +66,103 @@ fn pane_inner_rect(area: Rect, framed: bool) -> Rect {
     }
 }
 
+/// Resolve a pre-parsed border color config to an actual `Color` using the
+/// current palette.  Palette tokens are looked up; literal colours were
+/// already parsed at config-load time and are returned directly.
+fn resolve_border_color(config: &crate::config::BorderColorConfig, p: &Palette) -> Color {
+    if let Some(color) = config.parsed {
+        return color;
+    }
+    p.resolve_token(&config.raw)
+        .unwrap_or_else(|| crate::config::parse_color(&config.raw))
+}
+
+/// Resolve the correct junction character for a cell based on which of its
+/// four cardinal neighbors also have split lines. `fallback` is returned when
+/// no neighbors have lines (a degenerate single-cell line).
+fn junction_char(
+    v_above: bool,
+    v_below: bool,
+    h_left: bool,
+    h_right: bool,
+    vert_ch: char,
+    horiz_ch: char,
+    thick: bool,
+    fallback: char,
+) -> char {
+    let thin_ch = match (v_above, v_below, h_left, h_right) {
+        // Simple lines.
+        (true, true, false, false) => vert_ch,
+        (false, false, true, true) => horiz_ch,
+        // T-junction: vertical line passes through, horizontal on right.
+        (true, true, false, true) => '├',
+        // T-junction: vertical line passes through, horizontal on left.
+        (true, true, true, false) => '┤',
+        // T-junction: horizontal line passes through, vertical below.
+        (false, true, true, true) => '┬',
+        // T-junction: horizontal line passes through, vertical above.
+        (true, false, true, true) => '┴',
+        // Full crossing.
+        (true, true, true, true) => '┼',
+        // Edges: vertical continuation at pane boundary.
+        (true, false, false, false) | (false, true, false, false) => vert_ch,
+        // Edges: horizontal continuation at pane boundary.
+        (false, false, true, false) | (false, false, false, true) => horiz_ch,
+        // Degenerate: no neighbor lines.
+        (false, false, false, false) => fallback,
+        // Catch-all for unusual patterns (corner elements).
+        _ => '┼',
+    };
+    if thick {
+        match thin_ch {
+            '├' => '┣',
+            '┤' => '┫',
+            '┬' => '┳',
+            '┴' => '┻',
+            '┼' => '╋',
+            other => other,
+        }
+    } else {
+        thin_ch
+    }
+}
+
+/// Convert a PaneBorderStyle config value to a ratatui border::Set.
+fn border_set_for_style(style: &PaneBorderStyle) -> ratatui::symbols::border::Set<'_> {
+    match style {
+        PaneBorderStyle::Thick => ratatui::symbols::border::THICK,
+        PaneBorderStyle::Plain => ratatui::symbols::border::PLAIN,
+    }
+}
+
+/// Compute the pane inner rect for Line mode, shrinking edges that share a split line.
+fn inner_rect_for_line_mode(pane_rect: Rect, splits: &[SplitBorder]) -> Rect {
+    let mut inner = pane_rect;
+    for split in splits {
+        match split.direction {
+            ratatui::layout::Direction::Horizontal => {
+                // Vertical split line at x = pos
+                if split.pos == pane_rect.x {
+                    inner.x += 1;
+                    inner.width = inner.width.saturating_sub(1);
+                } else if split.pos == pane_rect.x + pane_rect.width {
+                    inner.width = inner.width.saturating_sub(1);
+                }
+            }
+            ratatui::layout::Direction::Vertical => {
+                // Horizontal split line at y = pos
+                if split.pos == pane_rect.y {
+                    inner.y += 1;
+                    inner.height = inner.height.saturating_sub(1);
+                } else if split.pos == pane_rect.y + pane_rect.height {
+                    inner.height = inner.height.saturating_sub(1);
+                }
+            }
+        }
+    }
+    inner
+}
+
 fn runtime_for_tab_pane<'a>(
     terminal_runtimes: &'a TerminalRuntimeRegistry,
     tab: &'a crate::workspace::Tab,
@@ -106,11 +206,21 @@ pub(super) fn resize_tab_panes(
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
     let multi_pane = tab.layout.pane_count() > 1;
+    let line_mode = multi_pane && app.pane_border_mode == PaneBorderMode::Line;
+    let splits = if line_mode {
+        Some(tab.layout.splits(area))
+    } else {
+        None
+    };
 
     if tab.zoomed {
         let focused_id = tab.layout.focused();
         if let Some((terminal_id, rt)) = runtime_for_tab_pane(terminal_runtimes, tab, focused_id) {
-            let pane_inner = pane_inner_rect(area, multi_pane);
+            let pane_inner = if multi_pane && app.pane_border_mode == PaneBorderMode::Box {
+                pane_inner_rect(area, true)
+            } else {
+                area
+            };
             let inner_rect = stable_terminal_inner_rect(pane_inner);
             if !app.direct_attach_resize_locks.contains(terminal_id) {
                 rt.resize(
@@ -125,8 +235,14 @@ pub(super) fn resize_tab_panes(
     }
 
     for info in tab.layout.panes(area) {
-        let pane_inner = if multi_pane {
+        let pane_inner = if multi_pane && app.pane_border_mode == PaneBorderMode::Box {
             Block::default().borders(Borders::ALL).inner(info.rect)
+        } else if line_mode {
+            if let Some(ref splits) = splits {
+                inner_rect_for_line_mode(info.rect, splits)
+            } else {
+                info.rect
+            }
         } else {
             area
         };
@@ -152,6 +268,7 @@ pub(super) fn compute_pane_infos(
     area: Rect,
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
+    split_borders: &[SplitBorder],
 ) -> Vec<PaneInfo> {
     let Some(ws_idx) = app.active else {
         return Vec::new();
@@ -161,11 +278,12 @@ pub(super) fn compute_pane_infos(
     };
 
     let multi_pane = ws.layout.pane_count() > 1;
-    let terminal_active = app.mode == Mode::Terminal;
+    let line_mode = multi_pane && app.pane_border_mode == PaneBorderMode::Line;
 
     if ws.zoomed {
         let focused_id = ws.layout.focused();
-        let pane_inner = pane_inner_rect(area, multi_pane);
+        let framed = multi_pane && app.pane_border_mode == PaneBorderMode::Box;
+        let pane_inner = pane_inner_rect(area, framed);
         let mut inner_rect = pane_inner;
         let mut scrollbar_rect = None;
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, focused_id) {
@@ -195,16 +313,10 @@ pub(super) fn compute_pane_infos(
     let mut pane_infos = ws.layout.panes(area);
 
     for info in &mut pane_infos {
-        let pane_inner = if multi_pane {
-            let border_set = if info.is_focused && terminal_active {
-                ratatui::symbols::border::THICK
-            } else {
-                ratatui::symbols::border::PLAIN
-            };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_set(border_set);
-            block.inner(info.rect)
+        let pane_inner = if multi_pane && app.pane_border_mode == PaneBorderMode::Box {
+            Block::default().borders(Borders::ALL).inner(info.rect)
+        } else if line_mode {
+            inner_rect_for_line_mode(info.rect, split_borders)
         } else {
             area
         };
@@ -234,6 +346,143 @@ pub(super) fn compute_pane_infos(
     pane_infos
 }
 
+/// Draw single-character split lines between panes in Line mode.
+/// Uses a two-pass approach: first collect which cells have vertical and
+/// horizontal lines, then determine the correct junction character for each cell
+/// by checking all four cardinal neighbors.
+///
+/// Walk a single row or column of a split line, inserting cells into `cells`
+/// and (when the position falls within the focused pane's extent) `active_cells`.
+fn fill_split_line(
+    cells: &mut HashSet<(u16, u16)>,
+    active_cells: &mut HashSet<(u16, u16)>,
+    range: std::ops::Range<u16>,
+    fixed: u16,
+    direction: ratatui::layout::Direction,
+    buf_width: u16,
+    buf_height: u16,
+    focused_rect: Option<Rect>,
+) {
+    let vertical_line = direction == ratatui::layout::Direction::Horizontal;
+    for var in range {
+        let (x, y) = if vertical_line {
+            (fixed, var)
+        } else {
+            (var, fixed)
+        };
+        if x >= buf_width || y >= buf_height {
+            continue;
+        }
+        cells.insert((x, y));
+        let Some(fr) = focused_rect else {
+            continue;
+        };
+        let in_extent = if vertical_line {
+            var >= fr.y && var <= fr.y + fr.height
+        } else {
+            var >= fr.x && var <= fr.x + fr.width
+        };
+        if in_extent {
+            active_cells.insert((x, y));
+        }
+    }
+}
+
+fn render_split_lines(
+    app: &AppState,
+    frame: &mut Frame,
+    active_color: &Color,
+    inactive_color: &Color,
+    border_set: &ratatui::symbols::border::Set<'_>,
+) {
+    let buf = frame.buffer_mut();
+
+    let mut vertical_cells: HashSet<(u16, u16)> = HashSet::new();
+    let mut horizontal_cells: HashSet<(u16, u16)> = HashSet::new();
+    // Cells that touch the focused pane → rendered with active_color.
+    let mut active_cells: HashSet<(u16, u16)> = HashSet::new();
+
+    // Find the focused pane so we can determine which split lines touch it.
+    let focused_info = app.view.pane_infos.iter().find(|info| info.is_focused);
+
+    for split in &app.view.split_borders {
+        // The focused pane's rect when this split borders the focused pane.
+        let focused_rect = focused_info.and_then(|fi| {
+            let touches = match split.direction {
+                ratatui::layout::Direction::Horizontal => {
+                    split.pos == fi.rect.x || split.pos == fi.rect.x + fi.rect.width
+                }
+                ratatui::layout::Direction::Vertical => {
+                    split.pos == fi.rect.y || split.pos == fi.rect.y + fi.rect.height
+                }
+            };
+            if touches {
+                Some(fi.rect)
+            } else {
+                None
+            }
+        });
+
+        match split.direction {
+            ratatui::layout::Direction::Horizontal => {
+                fill_split_line(
+                    &mut vertical_cells,
+                    &mut active_cells,
+                    split.area.y..split.area.y + split.area.height,
+                    split.pos,
+                    ratatui::layout::Direction::Horizontal,
+                    buf.area.width,
+                    buf.area.height,
+                    focused_rect,
+                );
+            }
+            ratatui::layout::Direction::Vertical => {
+                fill_split_line(
+                    &mut horizontal_cells,
+                    &mut active_cells,
+                    split.area.x..split.area.x + split.area.width,
+                    split.pos,
+                    ratatui::layout::Direction::Vertical,
+                    buf.area.width,
+                    buf.area.height,
+                    focused_rect,
+                );
+            }
+        }
+    }
+
+    // Draw every cell that has at least one line, using the correct
+    // junction character determined by checking all four neighbors.
+    let vert_ch = border_set.vertical_left.chars().next().unwrap_or('│');
+    let horiz_ch = border_set.horizontal_top.chars().next().unwrap_or('─');
+    let thick = app.pane_border_style == PaneBorderStyle::Thick;
+
+    for &(x, y) in vertical_cells.iter().chain(horizontal_cells.iter()) {
+        let v_above = y > 0 && vertical_cells.contains(&(x, y.saturating_sub(1)));
+        let v_below = y + 1 < buf.area.height && vertical_cells.contains(&(x, y + 1));
+        let h_left = x > 0 && horizontal_cells.contains(&(x.saturating_sub(1), y));
+        let h_right = x + 1 < buf.area.width && horizontal_cells.contains(&(x + 1, y));
+
+        let fallback = if vertical_cells.contains(&(x, y)) {
+            vert_ch
+        } else {
+            horiz_ch
+        };
+        let ch = junction_char(
+            v_above, v_below, h_left, h_right, vert_ch, horiz_ch, thick, fallback,
+        );
+
+        let cell_style = if active_cells.contains(&(x, y)) {
+            Style::default().fg(*active_color)
+        } else {
+            Style::default().fg(*inactive_color)
+        };
+
+        buf[(x, y)].set_char(ch);
+        buf[(x, y)].set_style(cell_style);
+    }
+}
+
 pub(super) fn render_panes(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -251,25 +500,30 @@ pub(super) fn render_panes(
 
     let multi_pane = ws.layout.pane_count() > 1;
     let terminal_active = app.mode == Mode::Terminal;
+    let box_mode = multi_pane && app.pane_border_mode == PaneBorderMode::Box;
+    let line_mode = multi_pane && app.pane_border_mode == PaneBorderMode::Line;
+
+    // Resolve border colors once per frame.
+    let active_border_color = resolve_border_color(&app.pane_border_active_color, &app.palette);
+    let inactive_border_color = resolve_border_color(&app.pane_border_inactive_color, &app.palette);
+    let configured_border_set = border_set_for_style(&app.pane_border_style);
 
     for info in &app.view.pane_infos {
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
-            if multi_pane {
-                let (border_style, border_set) = if info.is_focused && terminal_active {
-                    (
-                        Style::default().fg(app.palette.accent),
-                        ratatui::symbols::border::THICK,
-                    )
-                } else if info.is_focused {
-                    (
-                        Style::default().fg(app.palette.accent),
-                        ratatui::symbols::border::PLAIN,
-                    )
+            if box_mode {
+                let border_style = if info.is_focused {
+                    Style::default().fg(active_border_color)
                 } else {
-                    (
-                        Style::default().fg(app.palette.overlay0),
-                        ratatui::symbols::border::PLAIN,
-                    )
+                    Style::default().fg(inactive_border_color)
+                };
+
+                // Use the configured border style only when the user is
+                // actively in terminal mode on the focused pane.  Otherwise
+                // fall back to plain so the border visually recedes.
+                let border_set = if info.is_focused && terminal_active {
+                    configured_border_set
+                } else {
+                    ratatui::symbols::border::PLAIN
                 };
 
                 let mut block = Block::default()
@@ -319,6 +573,17 @@ pub(super) fn render_panes(
             );
             render_copy_mode_cursor(app, frame, info);
         }
+    }
+
+    // In Line mode, draw single-character split lines between panes.
+    if line_mode {
+        render_split_lines(
+            app,
+            frame,
+            &active_border_color,
+            &inactive_border_color,
+            &configured_border_set,
+        );
     }
 }
 
@@ -547,6 +812,7 @@ mod tests {
             area,
             false,
             crate::kitty_graphics::HostCellSize::default(),
+            &[],
         );
         let info = &infos[0];
 
@@ -576,6 +842,7 @@ mod tests {
             area,
             false,
             crate::kitty_graphics::HostCellSize::default(),
+            &[],
         );
         let info = &infos[0];
 
@@ -605,6 +872,7 @@ mod tests {
             area,
             false,
             crate::kitty_graphics::HostCellSize::default(),
+            &[],
         );
         let info = &infos[0];
 
@@ -634,6 +902,7 @@ mod tests {
             area,
             false,
             crate::kitty_graphics::HostCellSize::default(),
+            &[],
         );
         let info = &infos[0];
 
@@ -667,6 +936,7 @@ mod tests {
             area,
             false,
             crate::kitty_graphics::HostCellSize::default(),
+            &[],
         );
         let info = &infos[0];
 
@@ -757,5 +1027,221 @@ mod tests {
             panic!("selection background should resolve to rgb");
         };
         assert!(relative_luminance((r, g, b)) > relative_luminance((12, 14, 16)));
+    }
+
+    #[test]
+    fn resolve_border_color_palette_tokens() {
+        let p = Palette::catppuccin();
+        let accent = crate::config::BorderColorConfig::from_string("accent");
+        let overlay0 = crate::config::BorderColorConfig::from_string("overlay0");
+        let green = crate::config::BorderColorConfig::from_string("green");
+        let text = crate::config::BorderColorConfig::from_string("text");
+        assert_eq!(resolve_border_color(&accent, &p), p.accent);
+        assert_eq!(resolve_border_color(&overlay0, &p), p.overlay0);
+        assert_eq!(resolve_border_color(&green, &p), p.green);
+        assert_eq!(resolve_border_color(&text, &p), p.text);
+    }
+
+    #[test]
+    fn resolve_border_color_falls_back_to_literal() {
+        let p = Palette::catppuccin();
+        // Palette token names take precedence over terminal color names.
+        let red = crate::config::BorderColorConfig::from_string("red");
+        assert_eq!(resolve_border_color(&red, &p), p.red);
+        // Unknown names fall through to literal color parsing.
+        let hex = crate::config::BorderColorConfig::from_string("#ff0000");
+        assert_eq!(resolve_border_color(&hex, &p), Color::Rgb(255, 0, 0));
+        let named = crate::config::BorderColorConfig::from_string("lightred");
+        assert_eq!(resolve_border_color(&named, &p), Color::LightRed);
+    }
+
+    #[test]
+    fn inner_rect_for_line_mode_shrinks_split_edges() {
+        use ratatui::layout::{Direction, Rect};
+
+        // Simple 2-pane horizontal split (left/right)
+        let splits = vec![SplitBorder {
+            pos: 50,
+            direction: Direction::Horizontal,
+            ratio: 0.5,
+            area: Rect::new(0, 0, 100, 24),
+            path: vec![],
+        }];
+
+        let left_rect = Rect::new(0, 0, 50, 24);
+        let right_rect = Rect::new(50, 0, 50, 24);
+
+        let left_inner = inner_rect_for_line_mode(left_rect, &splits);
+        assert_eq!(left_inner, Rect::new(0, 0, 49, 24));
+
+        let right_inner = inner_rect_for_line_mode(right_rect, &splits);
+        assert_eq!(right_inner, Rect::new(51, 0, 49, 24));
+    }
+
+    #[test]
+    fn inner_rect_for_line_mode_t_junction() {
+        use ratatui::layout::{Direction, Rect};
+
+        // T-layout: left side split into top/bottom, right side full height.
+        // Left-top (A): (0,0,50,12), Left-bottom (C): (0,12,50,12), Right (B): (50,0,50,24)
+        let splits = vec![
+            SplitBorder {
+                pos: 50,
+                direction: Direction::Horizontal,
+                ratio: 0.5,
+                area: Rect::new(0, 0, 100, 24),
+                path: vec![],
+            },
+            SplitBorder {
+                pos: 12,
+                direction: Direction::Vertical,
+                ratio: 0.5,
+                area: Rect::new(0, 0, 50, 24),
+                path: vec![false],
+            },
+        ];
+
+        // Pane A: (0, 0, 50, 12) → right edge shrunk (split at 50), bottom edge shrunk (split at 12)
+        let a = inner_rect_for_line_mode(Rect::new(0, 0, 50, 12), &splits);
+        assert_eq!(a, Rect::new(0, 0, 49, 11));
+
+        // Pane C: (0, 12, 50, 12) → right edge shrunk (split at 50), top edge shrunk (split at 12)
+        let c = inner_rect_for_line_mode(Rect::new(0, 12, 50, 12), &splits);
+        assert_eq!(c, Rect::new(0, 13, 49, 11));
+
+        // Pane B: (50, 0, 50, 24) → left edge shrunk (split at 50)
+        let b = inner_rect_for_line_mode(Rect::new(50, 0, 50, 24), &splits);
+        assert_eq!(b, Rect::new(51, 0, 49, 24));
+    }
+
+    #[test]
+    fn junction_char_simple_lines() {
+        let v = '│';
+        let h = '─';
+        // Vertical pass-through.
+        assert_eq!(
+            junction_char(true, true, false, false, v, h, false, '.'),
+            '│'
+        );
+        // Horizontal pass-through.
+        assert_eq!(
+            junction_char(false, false, true, true, v, h, false, '.'),
+            '─'
+        );
+    }
+
+    #[test]
+    fn junction_char_t_junctions() {
+        let v = '│';
+        let h = '─';
+        // Thin T-junctions.
+        assert_eq!(
+            junction_char(true, true, false, true, v, h, false, '.'),
+            '├'
+        );
+        assert_eq!(
+            junction_char(true, true, true, false, v, h, false, '.'),
+            '┤'
+        );
+        assert_eq!(
+            junction_char(false, true, true, true, v, h, false, '.'),
+            '┬'
+        );
+        assert_eq!(
+            junction_char(true, false, true, true, v, h, false, '.'),
+            '┴'
+        );
+        // Thick T-junctions.
+        assert_eq!(junction_char(true, true, false, true, v, h, true, '.'), '┣');
+        assert_eq!(junction_char(true, true, true, false, v, h, true, '.'), '┫');
+        assert_eq!(junction_char(false, true, true, true, v, h, true, '.'), '┳');
+        assert_eq!(junction_char(true, false, true, true, v, h, true, '.'), '┻');
+    }
+
+    #[test]
+    fn junction_char_full_crossing() {
+        let v = '│';
+        let h = '─';
+        assert_eq!(junction_char(true, true, true, true, v, h, false, '.'), '┼');
+        assert_eq!(junction_char(true, true, true, true, v, h, true, '.'), '╋');
+    }
+
+    #[test]
+    fn junction_char_edge_single_direction() {
+        let v = '│';
+        let h = '─';
+        // Vertical only — one end terminates at pane boundary.
+        assert_eq!(
+            junction_char(true, false, false, false, v, h, false, '.'),
+            '│'
+        );
+        assert_eq!(
+            junction_char(false, true, false, false, v, h, false, '.'),
+            '│'
+        );
+        // Horizontal only.
+        assert_eq!(
+            junction_char(false, false, true, false, v, h, false, '.'),
+            '─'
+        );
+        assert_eq!(
+            junction_char(false, false, false, true, v, h, false, '.'),
+            '─'
+        );
+    }
+
+    #[test]
+    fn junction_char_degenerate_uses_fallback() {
+        let v = '│';
+        let h = '─';
+        assert_eq!(
+            junction_char(false, false, false, false, v, h, false, '│'),
+            '│'
+        );
+        assert_eq!(
+            junction_char(false, false, false, false, v, h, false, '─'),
+            '─'
+        );
+    }
+
+    #[test]
+    fn junction_char_catch_all_patterns() {
+        let v = '│';
+        let h = '─';
+        // Corner patterns with no continuation on one side.
+        // thin.
+        assert_eq!(
+            junction_char(false, true, false, true, v, h, false, '.'),
+            '┼'
+        );
+        assert_eq!(
+            junction_char(false, true, true, false, v, h, false, '.'),
+            '┼'
+        );
+        assert_eq!(
+            junction_char(true, false, false, true, v, h, false, '.'),
+            '┼'
+        );
+        assert_eq!(
+            junction_char(true, false, true, false, v, h, false, '.'),
+            '┼'
+        );
+        // thick.
+        assert_eq!(
+            junction_char(false, true, false, true, v, h, true, '.'),
+            '╋'
+        );
+        assert_eq!(
+            junction_char(false, true, true, false, v, h, true, '.'),
+            '╋'
+        );
+        assert_eq!(
+            junction_char(true, false, false, true, v, h, true, '.'),
+            '╋'
+        );
+        assert_eq!(
+            junction_char(true, false, true, false, v, h, true, '.'),
+            '╋'
+        );
     }
 }

@@ -567,6 +567,31 @@ impl Palette {
         }
         self
     }
+
+    /// Resolve a palette token name to its Color value.
+    /// Returns `None` for unrecognised names (caller should fall back to
+    /// literal color parsing).
+    pub fn resolve_token(&self, key: &str) -> Option<Color> {
+        match key {
+            "accent" => Some(self.accent),
+            "overlay0" => Some(self.overlay0),
+            "overlay1" => Some(self.overlay1),
+            "text" => Some(self.text),
+            "subtext0" => Some(self.subtext0),
+            "surface0" => Some(self.surface0),
+            "surface1" => Some(self.surface1),
+            "surface_dim" => Some(self.surface_dim),
+            "panel_bg" => Some(self.panel_bg),
+            "mauve" => Some(self.mauve),
+            "green" => Some(self.green),
+            "yellow" => Some(self.yellow),
+            "red" => Some(self.red),
+            "blue" => Some(self.blue),
+            "teal" => Some(self.teal),
+            "peach" => Some(self.peach),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1362,6 +1387,14 @@ pub struct AppState {
     pub confirm_close: bool,
     pub prompt_new_tab_name: bool,
     pub show_agent_labels_on_pane_borders: bool,
+    /// Pane border visual mode: box (full per-pane borders) or line (split-lines only).
+    pub pane_border_mode: crate::config::PaneBorderMode,
+    /// Pane border character style: thick or plain.
+    pub pane_border_style: crate::config::PaneBorderStyle,
+    /// Pane border active color — pre-parsed at config-load time.
+    pub pane_border_active_color: crate::config::BorderColorConfig,
+    /// Pane border inactive color — pre-parsed at config-load time.
+    pub pane_border_inactive_color: crate::config::BorderColorConfig,
     pub pane_history_persistence: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
@@ -1716,6 +1749,10 @@ impl AppState {
             confirm_close: true,
             prompt_new_tab_name: true,
             show_agent_labels_on_pane_borders: false,
+            pane_border_mode: crate::config::PaneBorderMode::Box,
+            pane_border_style: crate::config::PaneBorderStyle::Thick,
+            pane_border_active_color: crate::config::BorderColorConfig::from_string("accent"),
+            pane_border_inactive_color: crate::config::BorderColorConfig::from_string("overlay0"),
             pane_history_persistence: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
